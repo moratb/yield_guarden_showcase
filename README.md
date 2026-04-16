@@ -23,7 +23,7 @@ For positions with **no impermanent loss exposure** — lending protocols, staki
 
 ### Demo — Opening a Simple Position
 
-https://github.com/user-attachments/assets/output.mp4
+![Demo](assets/output.gif)
 
 ---
 
