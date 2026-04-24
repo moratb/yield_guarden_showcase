@@ -55,7 +55,7 @@ $$
 \mathrm{EV}_t \ = \ r^{\text{fee}}_t \cdot \mathbb{E}[\tau_{\text{exit}} \mid P_t] \ - \ \bigl(\mathrm{IL}^{\text{edge}} - \mathrm{IL}^{\text{now}}_t\bigr)
 $$
 
-where $r^{\text{fee}}_t$ is in USD/min, $\mathbb{E}[\tau_{\text{exit}} \mid P_t]$ in minutes, and the IL term in USD.
+where the fee rate is in USD/min, the expected exit time is in minutes, and the IL term is in USD.
 
 - `EV > 0` → future fees are expected to outpace the remaining IL budget. **Stay.**
 - `EV < 0` → remaining IL exceeds what fees can cover. **Exit.**
