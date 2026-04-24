@@ -17,5 +17,4 @@ def expected_time_in_range(
     lower: float,
     upper: float,
     sigma_per_minute: Optional[float],
-    max_minutes: float = 7 * 24 * 60.0,
 ) -> FPTSnapshot: ...

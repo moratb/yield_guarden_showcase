@@ -52,8 +52,10 @@ Two approaches have been tried:
 **v2 — Expected-value signal (current approach).** Treat the exit decision as a forward-looking bet: at every monitoring tick, compare the expected *future* fee revenue against the *remaining* IL budget until the range boundary. Close only when the math turns negative.
 
 $$
-\mathrm{EV}_t \;=\; \underbrace{\hat{r}^{\text{fee}}_t}_{\text{USD/min}} \cdot \underbrace{\mathbb{E}[\tau_{\text{exit}} \mid P_t]}_{\text{minutes}} \;-\; \underbrace{\bigl(\mathrm{IL}^{\text{edge}} - \mathrm{IL}^{\text{now}}_t\bigr)}_{\text{USD remaining}}
+\mathrm{EV}_t \ = \ r^{\text{fee}}_t \cdot \mathbb{E}[\tau_{\text{exit}} \mid P_t] \ - \ \bigl(\mathrm{IL}^{\text{edge}} - \mathrm{IL}^{\text{now}}_t\bigr)
 $$
+
+where $r^{\text{fee}}_t$ is in USD/min, $\mathbb{E}[\tau_{\text{exit}} \mid P_t]$ in minutes, and the IL term in USD.
 
 - `EV > 0` → future fees are expected to outpace the remaining IL budget. **Stay.**
 - `EV < 0` → remaining IL exceeds what fees can cover. **Exit.**
@@ -64,7 +66,7 @@ The signal is smoothed with an EMA (α≈0.4) and requires N consecutive negativ
 
 Each input is measured from **live on-chain / exchange state** — not from advertised APY or backtest assumptions.
 
-**1. Live fee rate $\hat{r}^{\text{fee}}_t$ (USD/min)**
+**1. Live fee rate (USD/min)**
 
 Pool APY is averaged across all LPs and all ticks — a poor proxy for this specific position's accrual. Instead, the system snapshots the position's own `fees_owed` every tick, computes a rolling diff over a 30–60 min window, and EMA-smooths it. This is the number that actually matters for the exit decision.
 
@@ -73,15 +75,15 @@ Pool APY is averaged across all LPs and all ticks — a poor proxy for this spec
 Closed-form first-passage time for a zero-drift Brownian motion in log-price, stopped at $[\ln P_{\text{lower}}, \ln P_{\text{upper}}]$:
 
 $$
-\mathbb{E}[\tau_{\text{exit}} \mid P_t] \;\approx\; \frac{\bigl(\ln P_{\text{upper}} - \ln P_t\bigr)\cdot\bigl(\ln P_t - \ln P_{\text{lower}}\bigr)}{\sigma^2}
+\mathbb{E}[\tau_{\text{exit}} \mid P_t] \ \approx \ \frac{\bigl(\ln P_{\text{upper}} - \ln P_t\bigr)\cdot\bigl(\ln P_t - \ln P_{\text{lower}}\bigr)}{\sigma^2}
 $$
 
-The volatility $\sigma$ is an **EWMA** on log-returns of 15-min OHLCV bars (λ=0.94), normalized to per-minute units. OHLCV is pulled from the hedged perpetual market (or Birdeye as a fallback) and refreshed on a throttled cadence — not every tick. FPT is clamped at 7 days to avoid degenerate log-products near the range center.
+The volatility $\sigma$ is an **EWMA** on log-returns of 15-min OHLCV bars (λ=0.94).
 
 **3. IL budget remaining (USD)**
 
 - $\mathrm{IL}^{\text{edge}}$ — worst-case IL at the range boundary, computed once at position open from the chosen range width (same formula the entry workflow uses).
-- $\mathrm{IL}^{\text{now}}_t$ — live IL at current price, approximated as $(\Delta p / 2)^2 / \text{half\_range} \cdot \text{total\_position}$ for small drifts.
+- $\mathrm{IL}^{\text{now}}_t$ — live IL at current price, approximated from $\Delta p$, the half-range, and the total position size for small drifts.
 - $\mathrm{IL}^{\text{remaining}}_t = \mathrm{IL}^{\text{edge}} - \mathrm{IL}^{\text{now}}_t$.
 
 Forward-looking by construction: near entry price the full budget is available; near the edge the budget collapses to zero and the EV signal turns negative automatically.
@@ -103,8 +105,8 @@ Every monitoring tick logs all five inputs plus the combined signal, so a broken
 
 The EV formula is intentionally simple for v1. Each extra term is a drop-in addition, not a rewrite:
 
-- **Funding rate** — `EV += E[r^{fund}_t] · E[τ]`. Signed cost on the perp hedge; can flip against the position in strong trends.
-- **LVR (Loss-Versus-Rebalancing)** — the continuous-time cost of the LP's mechanical rebalancing against an informed AMM. Scales as $\tfrac{1}{2}\sigma^2\Gamma P^2$; replaces the IL "budget" term for longer holds or higher-vol regimes.
+- **Funding rate** — signed cost on the perp hedge; can flip against the position in strong trends. Drops in as an extra term in EV.
+- **LVR (Loss-Versus-Rebalancing)** — the continuous-time cost of the LP's mechanical rebalancing against an informed AMM. Replaces the IL "budget" term for longer holds or higher-vol regimes.
 - **GARCH-X(1,1) σ** — upgrade from EWMA. Exogenous variable (`X`) is Hyperliquid perp volume; volume-conditioning is where the real payoff lives (plain GARCH over EWMA is marginal).
 - **Monte-Carlo FPT** — p25 / p50 / p75 of exit time under fitted vol, mirroring the quantile style of the entry excursion analysis.
 - **Trading cost amortization** — subtract expected close-side hedge + swap fees, amortized over $\mathbb{E}[\tau]$, to discourage over-trading.
@@ -164,7 +166,7 @@ Zoomed in on the advanced-mode exit logic:
 ```mermaid
 graph LR
     LPMgr["LPManager<br/>fees_owed, pool price"] --> FeeRate["FeeRateTracker<br/>rolling Δfees → EMA"]
-    OHLCV["15-min OHLCV<br/>(perp or Birdeye)"] --> Vol["EWMAVolatilityEstimator<br/>λ=0.94, σ / min"]
+    OHLCV["OHLCV"] --> Vol["EWMAVolatilityEstimator<br/>σ"]
     LPMgr --> FPT["expected_time_in_range<br/>log-FPT, zero-drift GBM"]
     Vol --> FPT
     LPMgr --> IL["il_snapshot<br/>IL_current, IL_remaining"]
