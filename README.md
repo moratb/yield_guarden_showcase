@@ -31,11 +31,6 @@ For positions with **no impermanent loss exposure** — lending protocols, staki
 
 For positions **exposed to impermanent loss** — concentrated liquidity pools on Orca Whirlpools. This is where the real challenge lies and where the system earns its keep.
 
-<p align="center">
-<img src="assets/takeprofit_pic.png" alt="Automated take-profit execution" width="70%">
-</p>
-<p align="center"><em>Automated take-profit: CLMM position closed after net PnL target reached</em></p>
-
 ### The Challenge
 
 DEX concentrated liquidity pools routinely advertise 500%+ APY. What stops people from capturing these yields? Three things:
@@ -44,30 +39,89 @@ DEX concentrated liquidity pools routinely advertise 500%+ APY. What stops peopl
 2. **Impermanent Loss (IL)** — the non-linear cost of price moving away from your entry. This is the real battle.
 3. **LVR (Loss-Versus-Rebalancing)** — a structural cost from arbitrageurs. Largely unavoidable.
 
-While directional risk is hedged by the short leg and LVR is a cost of doing business, **IL is the variable that determines profitability**.
+Directional risk is neutralized by the short leg. LVR is a cost of doing business. **IL is the free variable — and the exit decision is what determines profitability.**
 
-### Strategy Philosophy
+### Exit Philosophy — From Fixed Take-Profit to an Expected-Value Signal
 
-**The core insight:** IL is *impermanent* — if price returns to entry, IL vanishes. High APY means fast fee accumulation, which means costs are covered quickly. The goal is to select pools where:
+> *When should a CLMM position be closed?*
 
-> *"Time to cover IL fully"* < *"Time the position stays in range"*
+Two approaches have been tried:
 
-This creates a setup where we either close early via take-profit, or the accumulated yield fully covers IL by the time price exits the range.
+**v1 — Fixed take-profit (prior approach).** Close when realized `net_pnl` crosses a pre-set USD target. Easy to reason about, but the target is static: it ignores how much fee-rate is accruing *right now*, how much IL budget is still *unspent*, and how much *time* the position is expected to remain in range. Good pools were exited too early; bad ones were held too long.
 
-**The profitability equation:**
+**v2 — Expected-value signal (current approach).** Treat the exit decision as a forward-looking bet: at every monitoring tick, compare the expected *future* fee revenue against the *remaining* IL budget until the range boundary. Close only when the math turns negative.
+
+$$
+\mathrm{EV}_t \;=\; \underbrace{\hat{r}^{\text{fee}}_t}_{\text{USD/min}} \cdot \underbrace{\mathbb{E}[\tau_{\text{exit}} \mid P_t]}_{\text{minutes}} \;-\; \underbrace{\bigl(\mathrm{IL}^{\text{edge}} - \mathrm{IL}^{\text{now}}_t\bigr)}_{\text{USD remaining}}
+$$
+
+- `EV > 0` → future fees are expected to outpace the remaining IL budget. **Stay.**
+- `EV < 0` → remaining IL exceeds what fees can cover. **Exit.**
+
+The signal is smoothed with an EMA (α≈0.4) and requires N consecutive negative ticks to trigger, both to filter out single-tick noise from price wicks.
+
+### The Three Live Inputs
+
+Each input is measured from **live on-chain / exchange state** — not from advertised APY or backtest assumptions.
+
+**1. Live fee rate $\hat{r}^{\text{fee}}_t$ (USD/min)**
+
+Pool APY is averaged across all LPs and all ticks — a poor proxy for this specific position's accrual. Instead, the system snapshots the position's own `fees_owed` every tick, computes a rolling diff over a 30–60 min window, and EMA-smooths it. This is the number that actually matters for the exit decision.
+
+**2. Expected time in range $\mathbb{E}[\tau_{\text{exit}}]$ (minutes)**
+
+Closed-form first-passage time for a zero-drift Brownian motion in log-price, stopped at $[\ln P_{\text{lower}}, \ln P_{\text{upper}}]$:
+
+$$
+\mathbb{E}[\tau_{\text{exit}} \mid P_t] \;\approx\; \frac{\bigl(\ln P_{\text{upper}} - \ln P_t\bigr)\cdot\bigl(\ln P_t - \ln P_{\text{lower}}\bigr)}{\sigma^2}
+$$
+
+The volatility $\sigma$ is an **EWMA** on log-returns of 15-min OHLCV bars (λ=0.94), normalized to per-minute units. OHLCV is pulled from the hedged perpetual market (or Birdeye as a fallback) and refreshed on a throttled cadence — not every tick. FPT is clamped at 7 days to avoid degenerate log-products near the range center.
+
+**3. IL budget remaining (USD)**
+
+- $\mathrm{IL}^{\text{edge}}$ — worst-case IL at the range boundary, computed once at position open from the chosen range width (same formula the entry workflow uses).
+- $\mathrm{IL}^{\text{now}}_t$ — live IL at current price, approximated as $(\Delta p / 2)^2 / \text{half\_range} \cdot \text{total\_position}$ for small drifts.
+- $\mathrm{IL}^{\text{remaining}}_t = \mathrm{IL}^{\text{edge}} - \mathrm{IL}^{\text{now}}_t$.
+
+Forward-looking by construction: near entry price the full budget is available; near the edge the budget collapses to zero and the EV signal turns negative automatically.
+
+### Live Output
+
+Every monitoring tick logs all five inputs plus the combined signal, so a broken input is visible before it contaminates the decision:
 
 ```
-(Yield + Funding) - (Unrealized IL + Trading Costs) > 0
+💸 Fee rate:  fees=0.7077 USD, raw=+0.003108 USD/min, ema=+0.006626 USD/min (window=593s/600s, n=10)
+📈 EWMA σ (per-min): 9.513e-04
+🪓 IL:        now=0.7580 USD, remaining=17.0497 USD (Δpx=+1.45%, half_range=7.03%, total=1012.63)
+⏳ FPT:       E[t_remaining]=5192.51 min  (log_up=+0.0544, log_lo=+0.0864, in_range=True)
+🎯 EV[shadow]: ev=+17.3535 USD, ev_ema=+24.1981 USD
+💰 Net PnL:   net=-3.3127 USD, ema=-2.7966 USD
 ```
 
-**Execution philosophy — each position follows a structured lifecycle:**
+### Deferred Extensions (signal is additive)
 
-1. **Pool Selection** — scan for high-APY concentrated liquidity pools, filter for hedgeability
-2. **Range & Horizon Estimation** — analyze historical volatility to estimate how long a given price range will hold, and whether yield can cover worst-case IL within that window
-3. **Strategy Definition** — configure position sizing, hedge parameters, and take-profit target
-4. **Execution** — swap into the core token, open the hedge, deploy liquidity into the chosen range
-5. **Monitoring** — continuous loop tracking LP state, hedge P&L, fees, and funding in real time
-6. **Automated Exit** — close everything when take-profit is reached or price moves out of range
+The EV formula is intentionally simple for v1. Each extra term is a drop-in addition, not a rewrite:
+
+- **Funding rate** — `EV += E[r^{fund}_t] · E[τ]`. Signed cost on the perp hedge; can flip against the position in strong trends.
+- **LVR (Loss-Versus-Rebalancing)** — the continuous-time cost of the LP's mechanical rebalancing against an informed AMM. Scales as $\tfrac{1}{2}\sigma^2\Gamma P^2$; replaces the IL "budget" term for longer holds or higher-vol regimes.
+- **GARCH-X(1,1) σ** — upgrade from EWMA. Exogenous variable (`X`) is Hyperliquid perp volume; volume-conditioning is where the real payoff lives (plain GARCH over EWMA is marginal).
+- **Monte-Carlo FPT** — p25 / p50 / p75 of exit time under fitted vol, mirroring the quantile style of the entry excursion analysis.
+- **Trading cost amortization** — subtract expected close-side hedge + swap fees, amortized over $\mathbb{E}[\tau]$, to discourage over-trading.
+- **Opportunity cost** — exit threshold becomes "EV > EV of redeploying elsewhere", not just "EV > 0".
+
+### Exit in Action
+
+<table>
+<tr>
+<td width="50%"><img src="assets/takeprofit_pic.png" alt="Fixed take-profit exit" width="100%"></td>
+<td width="50%"><img src="assets/ev_shadow_pic.png" alt="EV signal exit" width="100%"></td>
+</tr>
+<tr>
+<td align="center"><em>v1 — fixed TP: CLMM position closed once <code>net_pnl_ema</code> crossed a pre-set USD target.</em></td>
+<td align="center"><em>v2 — EV signal: exit when <code>EMA(EV) &lt; 0</code> over N consecutive ticks.</em></td>
+</tr>
+</table>
 
 ---
 
@@ -85,6 +139,7 @@ graph TB
     AdvController --> HedgeMgr
     AdvController --> LPMgr["LPManager"]
     AdvController --> TrackMgr["TrackingManager"]
+    AdvController --> Signal["EV Signal Pipeline"]
 
     SwapMgr --> DEXAgg["DEX Aggregator"]
     HedgeMgr --> Connector["ExchangeConnector"]
@@ -102,6 +157,30 @@ The system manages two legs of a delta-neutral position simultaneously:
 
 Positions are opened and closed iteratively (DCA-style) to minimize slippage and price impact.
 
+### EV Signal Pipeline
+
+Zoomed in on the advanced-mode exit logic:
+
+```mermaid
+graph LR
+    LPMgr["LPManager<br/>fees_owed, pool price"] --> FeeRate["FeeRateTracker<br/>rolling Δfees → EMA"]
+    OHLCV["15-min OHLCV<br/>(perp or Birdeye)"] --> Vol["EWMAVolatilityEstimator<br/>λ=0.94, σ / min"]
+    LPMgr --> FPT["expected_time_in_range<br/>log-FPT, zero-drift GBM"]
+    Vol --> FPT
+    LPMgr --> IL["il_snapshot<br/>IL_current, IL_remaining"]
+    PosEntry["Position static:<br/>entry_price, range, IL_at_edge"] --> IL
+
+    FeeRate --> EV["compute_ev_usd<br/>update_ev_ema"]
+    FPT --> EV
+    IL --> EV
+
+    EV --> Controller["AdvancedYieldGuardController<br/>monitor_positions()"]
+    Controller --> Track["TrackingManager.record_tick<br/>(persists every input)"]
+    Controller -.->|"EMA(EV) &lt; 0 for N ticks"| Close["close sequence<br/>(shadow in v1, live in v2)"]
+```
+
+Every input is persisted per tick — not just the combined signal. The EV formula is a pure function of recorded state, which means the exact live signal can be replayed offline on past tracking data to tune `λ`, `α`, fee-rate window length, and exit-hysteresis N *before* any of them touch a live exit.
+
 ---
 
 ## Lifecycle — Advanced Mode
@@ -111,7 +190,7 @@ sequenceDiagram
     participant User
     participant CLI
     participant Controller
-    participant SwapLayer
+    participant SwapMgr
     participant HedgeMgr
     participant LPMgr
     participant TrackMgr
@@ -130,10 +209,11 @@ sequenceDiagram
     loop Every N seconds
         Controller->>LPMgr: get LP state
         Controller->>HedgeMgr: get hedge state
-        Controller->>TrackMgr: record snapshot
+        Controller->>Controller: update fee-rate, σ, FPT, IL → EV
+        Controller->>TrackMgr: record tick (incl. EV inputs)
         alt Out of range
             Controller->>Controller: close everything
-        else Take-profit reached
+        else EMA(EV) < 0 for N ticks
             Controller->>Controller: close everything
         end
     end
@@ -146,19 +226,22 @@ sequenceDiagram
 
 ---
 
-## Results
+## Results — Alpha, April 2026
 
-Last 5 consecutive profitable trades (April 2026):
+Live trading — battle-testing the system with real capital on USDC-quoted Orca CLMM pools, hedged on Hyperliquid perps.
 
-| # | Asset | APY at Entry | Allocation | TP % | Duration | Profit |
-|---|-------|-------------|------------|------|----------|--------|
-| 1 | ZEC   | 700%        | $1,000     | 0.25%| 12h      | **+$7.00** |
-| 2 | MON   | 1,500%      | $1,000     | 0.50%| 12h      | **+$10.00** |
-| 3 | PUMP  | 300%        | $1,000     | 0.10%| 14h      | **+$3.40** |
-| 4 | MON   | 1,500%      | $1,000     | 0.50%| 13h      | **+$9.33** |
-| 5 | ZEC   | 300%        | $1,000     | 0.10%| 10h      | **+$6.14** |
+| Metric | Value |
+|---|---|
+| Consecutive winning positions | **5 / 5** (100% win rate) |
+| Cumulative net PnL | **+$35.87** |
+| Allocation per position | $1,000 (fixed unit) |
+| Average hold time | ~12h |
+| Average net PnL per trade | +$7.17 (≈ **0.72% of deployed capital**, ~12h) |
+| Active EV-signal mode | **shadow** — logged and persisted every tick; not yet wired to trigger exits |
 
-**Total: +$35.87 across 5 trades, 100% win rate, ~12h avg hold time.**
+**Framing.** Sample size is intentionally small. The EV signal is currently running in shadow mode — its inputs and combined value are logged and persisted on every monitoring tick, but the live exit trigger is still the legacy path (fixed TP + out-of-range). Promotion of EV to a live exit is gated on two things: (1) a replay pass over the persisted SQLite tick history to tune `λ`, `α`, fee-rate window, and exit-hysteresis `N`; (2) a handful of additional shadow trades showing EV crossing zero *before* the fixed-TP or OOR trigger would have fired.
+
+Detailed per-position tick traces are available on request.
 
 ---
 
@@ -171,7 +254,8 @@ Last 5 consecutive profitable trades (April 2026):
 | Swaps | Jupiter Aggregator, Jito bundles |
 | LP Protocol | Orca Whirlpools (CLMM) |
 | Hedge Exchange | Perpetuals via `ccxt` |
+| Volatility | EWMA (`numpy`); GARCH-X on roadmap (`arch`) |
 | Data | SQLite, Pandas |
 | CLI | Python `cmd` module |
 
-> **Note:** This is a showcase repository. The full source code is in a private repo. The [modules/](modules/) directory contains sanitized class and method signatures to illustrate the system design.
+> **Note:** This is a showcase repository. The full source code is in a private repo. The [modules/](modules/) directory contains sanitized class and function signatures to illustrate the system design.
